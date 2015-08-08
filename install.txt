@@ -1,0 +1,247 @@
+一 环境信息
+机器：2 台  HP  ProLiant DL360 G6
+系统版本:  RHEL 5.5
+PostgreSQL 版本： 9.4.1
+主节点 IP： 192.168.1.15
+备节点 IP： 192.168.1.11
+Keepalived VIP：   192.168.1.26
+FENCE DEVICE： HP
+
+二 系统配置 ( 主备节点 )
+-- 创建用户
+groupadd pg94
+useradd pg94 -g pg94
+passwd pg94
+
+--创建目录
+mkdir -p /data01/pg_data/
+chown -R pg94:pg94 /data01/pg_data/
+su - pg94
+mkdir -p /data01/pg_data/pg_root
+chmod 0700 /data01/pg_data/pg_root
+
+--安装 Package
+yum  -y install gcc readline readline-devel zlib zlib-devel python-devel ipmitool
+
+
+三 PostgreSQL 软件安装  ( 主备节点 )
+--下载
+wget -c https://ftp.postgresql.org/pub/source/v9.4.1/postgresql-9.4.1.tar.bz2
+
+--安装 PostgreSQL 软件
+tar jxvf postgresql-9.4.1.tar.bz2 
+cd postgresql-9.4.1
+./configure --prefix=/opt/pgsql_9.4.1 --with-wal-blocksize=16 --with-pgport=1921
+gmake world
+gmake install-world
+ln -s /opt/pgsql_9.4.1 /opt/pgsql
+
+--配置环境变量
+vim /home/pg94/.bash_profile 
+
+export PGPORT=1921
+export PGUSER=postgres
+export PGDATA=/data01/pg_data/pg_root
+export LANG=en_US.utf8
+
+export PGHOME=/opt/pgsql
+export LD_LIBRARY_PATH=$PGHOME/lib:/lib64:/usr/lib64:/usr/local/lib64:/lib:/usr/lib:/usr/local/lib
+export DATE=`date +"%Y%m%d%H%M"`
+export PATH=$PGHOME/bin:$PATH:.
+export MANPATH=$PGHOME/share/man:$MANPATH
+alias rm='rm -i'
+alias ll='ls -lh'
+
+
+--初始化数据库 ( 主节点 )
+initdb -E UTF8 --locale=C  -D /data01/pg_data/pg_root -U postgres -W
+Ww0pIXSrFACFwIdMBTfo08F5d
+
+-- postgresql.conf 参数配置  ( 主节点 )
+listen_addresses = '*'          # what IP address(es) to listen on;
+port = 1921                             # (change requires restart)
+max_connections = 1000                  # (change requires restart)
+unix_socket_directories = '/tmp'        # comma-separated list of directories
+unix_socket_permissions = 0777          # begin with 0 to use octal notation
+shared_buffers = 1024MB                 # min 128kB
+work_mem = 4MB                          # min 64kB
+maintenance_work_mem = 1024MB           # min 1MB
+dynamic_shared_memory_type = posix      # the default is the first option
+bgwriter_delay = 10ms                   # 10-10000ms between rounds
+wal_level = hot_standby                 # minimal, archive, hot_standby, or logical
+synchronous_commit = off                # synchronization level;
+wal_buffers = -1                        # min 32kB, -1 sets based on shared_buffers
+checkpoint_segments = 32                # in logfile segments, min 1, 16MB each
+checkpoint_timeout = 5min               # range 30s-1h
+archive_mode = on               # allows archiving to be done
+archive_command = '/bin/date'           # command to use to archive a logfile segment
+max_wal_senders = 8             # max number of walsender processes
+wal_keep_segments = 128          # in logfile segments, 16MB each; 0 disables
+hot_standby = on                        # "on" allows queries during recovery
+default_statistics_target = 100 # range 1-10000
+constraint_exclusion = partition        # on, off, or partition
+log_destination = 'csvlog'              # Valid values are combinations of
+logging_collector = on          # Enable capturing of stderr and csvlog
+log_directory = 'pg_log'                # directory where log files are written,
+log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log' # log file name pattern,
+log_file_mode = 0600                    # creation mode for log files,
+log_rotation_age = 1d                   # Automatic rotation of logfiles will
+log_rotation_size = 10MB                # Automatic rotation of logfiles will
+log_timezone = 'PRC'
+datestyle = 'iso, mdy'
+timezone = 'PRC'
+lc_messages = 'C'                       # locale for system error message
+lc_monetary = 'C'                       # locale for monetary formatting
+lc_numeric = 'C'                        # locale for number formatting
+lc_time = 'C'                           # locale for time formatting
+
+
+四 流复制搭建
+--创建流复制用户( 主节点 )
+CREATE USER repuser
+  REPLICATION 
+  LOGIN
+  CONNECTION LIMIT 5
+  ENCRYPTED PASSWORD 'Hgo7haSIASGAJYSsFqbYfyx2q';
+
+-- 配置.pgpass 密码文件 (主，备节点)
+vim /home/pg94/.pgpass
+192.168.1.15:1921:replication:repuser:Hgo7haSIASGAJYSsFqbYfyx2q
+192.168.1.11:1921:replication:repuser:Hgo7haSIASGAJYSsFqbYfyx2q
+192.168.1.26:1921:replication:repuser:Hgo7haSIASGAJYSsFqbYfyx2q
+
+chmod 0600 /home/pg94/.pgpass 
+
+--配置 pg_hba.conf ( 主节点)
+# replication 
+host replication repuser 192.168.1.15/32 md5
+host replication repuser 192.168.1.11/32 md5
+host replication repuser 192.168.1.26/32 md5
+
+--主节点配置 recovery.done (主节点)
+cp /opt/pgsql_9.4.1/share/recovery.conf.sample recovery.done
+recovery_target_timeline = 'latest'
+standby_mode = on
+primary_conninfo = 'host=192.168.1.11 port=1921 user=repuser'
+
+--pg_basebackup ( 备节点 )
+pg_basebackup -D /data01/pg_data/pg_root -Fp -Xs -v -P -h 192.168.1.11 -p 1921 -U repuser
+cp ~/recovery.conf ~/pg_hba.conf $PGDATA
+
+--备节点配置 recovery.conf (备节点)
+mv recovery.done recovery.conf
+recovery_target_timeline = 'latest'
+standby_mode = on
+primary_conninfo = 'host=192.168.1.15 port=1921 user=repuser'
+
+--启备库
+pg_ctl start 
+备注：启动备库并观察流复制是否搭建成功。
+
+五 sky_pg_cluster 数据库配置
+--初始数据部署
+create role sky_pg_cluster superuser nocreatedb nocreaterole noinherit login encrypted password 'qXzpigJCRmamDf6vv0uFpf4Qg';
+create database sky_pg_cluster with template template0 encoding 'UTF8' owner sky_pg_cluster;
+\c sky_pg_cluster  sky_pg_cluster
+create schema sky_pg_cluster ;
+create table cluster_status (id int unique default 1, last_alive timestamp(0) without time zone);
+
+--限制cluster_status表有且只有一行 :
+CREATE FUNCTION cannt_delete ()
+RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+RAISE EXCEPTION 'You can not delete!';
+END; $$;
+
+CREATE TRIGGER cannt_delete BEFORE DELETE ON cluster_status FOR EACH ROW EXECUTE PROCEDURE cannt_delete();
+CREATE TRIGGER cannt_truncate BEFORE TRUNCATE ON cluster_status FOR STATEMENT EXECUTE PROCEDURE cannt_delete();
+
+-- 插入初始数据
+insert into cluster_status values (1, now());
+
+--pg_hba.conf
+# sky_pg_cluster
+host sky_pg_cluster sky_pg_cluster 127.0.0.1/32 md5
+host sky_pg_cluster sky_pg_cluster 192.168.1.15/32 md5
+host sky_pg_cluster sky_pg_cluster 192.168.1.11/32 md5
+host sky_pg_cluster sky_pg_cluster 192.168.2.138/32 md5
+
+备注：结合 keepalived 的 interval 配置，每 10 秒更新 cluster_status 表。
+
+六 安装  Keepalived 
+--下载
+wget http://www.keepalived.org/software/keepalived-1.2.15.tar.gz
+
+-- 安装 OpenSSL , popt 包
+yum -y install openssl  openssl-devel popt
+
+--解压安装
+cd keepalived-1.2.15
+tar xvf keepalived-1.2.15.tar.gz 
+# ./configure --prefix=/usr/local/keepalived --sysconf=/etc
+# make
+# make install
+
+--报错
+keepalived configure: error: No SO_MARK declaration in headers
+备注：解决方法 --disable-fwmark
+
+--遇到的错误
+[root@db1 ~]# /etc/init.d/keepalived start
+Starting keepalived: /bin/bash: keepalived: command not found
+                                                           [FAILED]
+                                                           
+--解决方法
+ln -s /usr/local/keepalived/sbin/keepalived  /usr/sbin/
+
+--启动 keepalived
+[root@db1 etc]# service keepalived restart
+Stopping keepalived:                                       [  OK  ]
+Starting keepalived:                                       [  OK  ]
+
+--设置 keepalived 开机关闭
+[root@db1 etc]# chkconfig keepalived off
+
+
+七  配置 Keepalived
+--/etc/keepalived/keepalived.conf
+! Configuration File for keepalived
+
+global_defs {
+   notification_email {
+     francs3@163.com
+   }
+   smtp_server 127.0.0.1
+   smtp_connect_timeout 30
+   router_id DB1_PG_HA
+}
+
+ vrrp_script check_pg_alived {
+    script "/usr/local/bin/pg_moniter.sh" 
+    interval 10 
+    fall 5    # require 5 failures for KO
+} 
+
+vrrp_instance VI_1 {
+    state BACKUP
+    nopreempt
+    interface em1
+    virtual_router_id 10
+    priority 100
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass t9rveMP0Z9S1
+    }
+      track_script { 
+        check_pg_alived
+     }
+    virtual_ipaddress {
+        192.168.1.26
+    }
+     smtp_alert
+     notify_master /usr/local/bin/active_standby.sh
+}
+
+备注：备节点的 keepalived 的配置和主节点的基本一样，除了 priority 改成 90。
